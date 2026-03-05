@@ -1,7 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as http from 'http';
 import * as https from 'https';
+import * as tls from 'tls';
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
 import type { UsageData } from './types.js';
@@ -41,8 +43,10 @@ interface UsageApiResult {
 }
 
 // File-based cache (HUD runs as new process each render, so in-memory cache won't persist)
+// All terminals share one cache file; a fetch lock ensures only one fetches at a time.
 const CACHE_TTL_MS = 60_000; // 60 seconds
 const CACHE_FAILURE_TTL_MS = 15_000; // 15 seconds for failed requests
+const FETCH_LOCK_TTL_MS = 15_000; // 15 seconds — must cover keychain(3s) + proxy(5s) + request(5s)
 const KEYCHAIN_TIMEOUT_MS = 3000;
 const KEYCHAIN_BACKOFF_MS = 60_000; // Backoff on keychain failures to avoid re-prompting
 
@@ -53,6 +57,55 @@ interface CacheFile {
 
 function getCachePath(homeDir: string): string {
   return path.join(getHudPluginDir(homeDir), '.usage-cache.json');
+}
+
+function getFetchLockPath(homeDir: string): string {
+  return path.join(getHudPluginDir(homeDir), '.usage-fetch-lock');
+}
+
+/**
+ * Check if another HUD process is currently fetching usage data.
+ * Uses a file-based lock with TTL to prevent multiple terminals from
+ * hitting the API simultaneously.
+ */
+function isFetchLocked(homeDir: string, now: number): boolean {
+  try {
+    const lockPath = getFetchLockPath(homeDir);
+    if (!fs.existsSync(lockPath)) return false;
+    const timestamp = parseInt(fs.readFileSync(lockPath, 'utf8'), 10);
+    return now - timestamp < FETCH_LOCK_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+
+function acquireFetchLock(homeDir: string, now: number): void {
+  try {
+    fs.writeFileSync(getFetchLockPath(homeDir), String(now), 'utf8');
+  } catch { /* ignore */ }
+}
+
+function releaseFetchLock(homeDir: string): void {
+  try {
+    const lockPath = getFetchLockPath(homeDir);
+    if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+  } catch { /* ignore */ }
+}
+
+/** Read cache ignoring TTL — returns stale data when another process is fetching */
+function readStaleCache(homeDir: string): UsageData | null {
+  try {
+    const cachePath = getCachePath(homeDir);
+    if (!fs.existsSync(cachePath)) return null;
+    const content = fs.readFileSync(cachePath, 'utf8');
+    const cache: CacheFile = JSON.parse(content);
+    const data = cache.data;
+    if (data.fiveHourResetAt) data.fiveHourResetAt = new Date(data.fiveHourResetAt);
+    if (data.sevenDayResetAt) data.sevenDayResetAt = new Date(data.sevenDayResetAt);
+    return data;
+  } catch {
+    return null;
+  }
 }
 
 function readCache(homeDir: string, now: number): UsageData | null {
@@ -120,7 +173,8 @@ const defaultDeps: UsageApiDeps = {
  * Returns { apiUnavailable: true, ... } if API call fails (to show warning in HUD).
  *
  * Uses file-based cache since HUD runs as a new process each render (~300ms).
- * Cache TTL: 60s for success, 15s for failures.
+ * A file-based fetch lock ensures only one terminal fetches at a time,
+ * preventing rate limit (429) errors from concurrent requests.
  */
 export async function getUsage(overrides: Partial<UsageApiDeps> = {}): Promise<UsageData | null> {
   const deps = { ...defaultDeps, ...overrides };
@@ -133,9 +187,19 @@ export async function getUsage(overrides: Partial<UsageApiDeps> = {}): Promise<U
     return cached;
   }
 
+  // Centralized fetch: if another terminal is already fetching, use stale cache
+  if (isFetchLocked(homeDir, now)) {
+    debug('Another process is fetching, using stale cache');
+    return readStaleCache(homeDir);
+  }
+
+  // Acquire lock — this terminal will be the one to fetch
+  acquireFetchLock(homeDir, now);
+
   try {
     const credentials = readCredentials(homeDir, now, deps.readKeychain);
     if (!credentials) {
+      releaseFetchLock(homeDir);
       return null;
     }
 
@@ -145,6 +209,7 @@ export async function getUsage(overrides: Partial<UsageApiDeps> = {}): Promise<U
     const planName = getPlanName(subscriptionType);
     if (!planName) {
       // API user, no usage limits to show
+      releaseFetchLock(homeDir);
       return null;
     }
 
@@ -162,6 +227,7 @@ export async function getUsage(overrides: Partial<UsageApiDeps> = {}): Promise<U
         apiError: apiResult.error,
       };
       writeCache(homeDir, failureResult, now);
+      releaseFetchLock(homeDir);
       return failureResult;
     }
 
@@ -183,10 +249,12 @@ export async function getUsage(overrides: Partial<UsageApiDeps> = {}): Promise<U
 
     // Write to file cache
     writeCache(homeDir, result, now);
+    releaseFetchLock(homeDir);
 
     return result;
   } catch (error) {
     debug('getUsage failed:', error);
+    releaseFetchLock(homeDir);
     return null;
   }
 }
@@ -482,55 +550,126 @@ function parseDate(dateStr: string | undefined): Date | null {
   return date;
 }
 
+/**
+ * Fetch usage data from Anthropic API.
+ * Supports HTTP proxy via standard environment variables (https_proxy, HTTPS_PROXY, etc.).
+ * When a proxy is configured, establishes an HTTP CONNECT tunnel and wraps
+ * the tunneled socket in TLS before making the API request.
+ */
 function fetchUsageApi(accessToken: string): Promise<UsageApiResult> {
   return new Promise((resolve) => {
-    const options = {
-      hostname: 'api.anthropic.com',
-      path: '/api/oauth/usage',
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'anthropic-beta': 'oauth-2025-04-20',
-        'User-Agent': 'claude-hud/1.0',
-      },
-      timeout: 5000,
+    const targetHost = 'api.anthropic.com';
+    const targetPort = 443;
+    const targetPath = '/api/oauth/usage';
+    const reqHeaders: Record<string, string> = {
+      'Authorization': `Bearer ${accessToken}`,
+      'anthropic-beta': 'oauth-2025-04-20',
+      'User-Agent': 'claude-code/2.1',
     };
 
-    const req = https.request(options, (res) => {
-      let data = '';
+    const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY
+      || process.env.http_proxy || process.env.HTTP_PROXY;
 
-      res.on('data', (chunk: Buffer) => {
-        data += chunk.toString();
+    if (proxyUrl) {
+      // Use HTTP CONNECT tunnel through proxy
+      const proxy = new URL(proxyUrl);
+      const connectReq = http.request({
+        host: proxy.hostname,
+        port: parseInt(proxy.port, 10) || 7890,
+        method: 'CONNECT',
+        path: `${targetHost}:${targetPort}`,
+        timeout: 5000,
       });
 
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          debug('API returned non-200 status:', res.statusCode);
-          resolve({ data: null, error: res.statusCode ? `http-${res.statusCode}` : 'http-error' });
+      connectReq.on('connect', (_res, socket) => {
+        if (_res.statusCode !== 200) {
+          debug('Proxy CONNECT failed:', _res.statusCode);
+          resolve({ data: null, error: `proxy-${_res.statusCode}` });
           return;
         }
 
-        try {
-          const parsed: UsageApiResponse = JSON.parse(data);
-          resolve({ data: parsed });
-        } catch (error) {
-          debug('Failed to parse API response:', error);
-          resolve({ data: null, error: 'parse' });
-        }
+        // Wrap raw socket in TLS for HTTPS
+        const tlsSocket = tls.connect({
+          socket: socket,
+          servername: targetHost,
+        }, () => {
+          // Use http.request over the TLS socket (TLS already handled by tls.connect)
+          const req = http.request({
+            hostname: targetHost,
+            path: targetPath,
+            method: 'GET',
+            headers: { ...reqHeaders, 'Host': targetHost },
+            timeout: 5000,
+            createConnection: () => tlsSocket,
+          }, (res) => {
+            let data = '';
+            res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+            res.on('end', () => {
+              if (res.statusCode !== 200) {
+                debug('API returned non-200 status:', res.statusCode);
+                resolve({ data: null, error: res.statusCode ? `http-${res.statusCode}` : 'http-error' });
+                return;
+              }
+              try {
+                const parsed: UsageApiResponse = JSON.parse(data);
+                resolve({ data: parsed });
+              } catch (error) {
+                debug('Failed to parse API response:', error);
+                resolve({ data: null, error: 'parse' });
+              }
+            });
+          });
+          req.on('error', (error) => { debug('API request error:', error); resolve({ data: null, error: 'network' }); });
+          req.on('timeout', () => { debug('API request timeout'); req.destroy(); resolve({ data: null, error: 'timeout' }); });
+          req.end();
+        });
+
+        tlsSocket.on('error', (error) => {
+          debug('TLS connection error:', error);
+          resolve({ data: null, error: 'tls-error' });
+        });
       });
-    });
 
-    req.on('error', (error) => {
-      debug('API request error:', error);
-      resolve({ data: null, error: 'network' });
-    });
-    req.on('timeout', () => {
-      debug('API request timeout');
-      req.destroy();
-      resolve({ data: null, error: 'timeout' });
-    });
-
-    req.end();
+      connectReq.on('error', (error) => {
+        debug('Proxy connect error:', error);
+        resolve({ data: null, error: 'proxy-error' });
+      });
+      connectReq.on('timeout', () => {
+        debug('Proxy connect timeout');
+        connectReq.destroy();
+        resolve({ data: null, error: 'proxy-timeout' });
+      });
+      connectReq.end();
+    } else {
+      // Direct request without proxy
+      const req = https.request({
+        hostname: targetHost,
+        path: targetPath,
+        method: 'GET',
+        headers: reqHeaders,
+        timeout: 5000,
+      }, (res) => {
+        let data = '';
+        res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            debug('API returned non-200 status:', res.statusCode);
+            resolve({ data: null, error: res.statusCode ? `http-${res.statusCode}` : 'http-error' });
+            return;
+          }
+          try {
+            const parsed: UsageApiResponse = JSON.parse(data);
+            resolve({ data: parsed });
+          } catch (error) {
+            debug('Failed to parse API response:', error);
+            resolve({ data: null, error: 'parse' });
+          }
+        });
+      });
+      req.on('error', (error) => { debug('API request error:', error); resolve({ data: null, error: 'network' }); });
+      req.on('timeout', () => { debug('API request timeout'); req.destroy(); resolve({ data: null, error: 'timeout' }); });
+      req.end();
+    }
   });
 }
 
@@ -545,5 +684,6 @@ export function clearCache(homeDir?: string): void {
     } catch {
       // Ignore
     }
+    releaseFetchLock(homeDir);
   }
 }
