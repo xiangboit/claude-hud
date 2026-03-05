@@ -662,7 +662,7 @@ function fetchUsageApi(accessToken: string): Promise<UsageApiResult> {
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'anthropic-beta': 'oauth-2025-04-20',
-        'User-Agent': 'claude-hud/1.0',
+        'User-Agent': 'claude-code/2.1',
       },
       timeout: timeoutMs,
       agent: proxyUrl ? createProxyTunnelAgent(proxyUrl) : undefined,
