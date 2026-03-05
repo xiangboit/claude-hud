@@ -6,6 +6,7 @@ export const DEFAULT_CONFIG = {
     lineLayout: 'expanded',
     showSeparators: false,
     pathLevels: 1,
+    proxyUrl: null,
     gitStatus: {
         enabled: true,
         showDirty: true,
@@ -92,6 +93,9 @@ export function mergeConfig(userConfig) {
     const pathLevels = validatePathLevels(migrated.pathLevels)
         ? migrated.pathLevels
         : DEFAULT_CONFIG.pathLevels;
+    const proxyUrl = typeof migrated.proxyUrl === 'string' && migrated.proxyUrl.trim()
+        ? migrated.proxyUrl.trim()
+        : DEFAULT_CONFIG.proxyUrl;
     const gitStatus = {
         enabled: typeof migrated.gitStatus?.enabled === 'boolean'
             ? migrated.gitStatus.enabled
@@ -153,7 +157,7 @@ export function mergeConfig(userConfig) {
         sevenDayThreshold: validateThreshold(migrated.display?.sevenDayThreshold, 100),
         environmentThreshold: validateThreshold(migrated.display?.environmentThreshold, 100),
     };
-    return { lineLayout, showSeparators, pathLevels, gitStatus, display };
+    return { lineLayout, showSeparators, pathLevels, proxyUrl, gitStatus, display };
 }
 export async function loadConfig() {
     const configPath = getConfigPath();

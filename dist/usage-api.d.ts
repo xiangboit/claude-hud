@@ -16,12 +16,13 @@ interface UsageApiResult {
 }
 export type UsageApiDeps = {
     homeDir: () => string;
-    fetchApi: (accessToken: string) => Promise<UsageApiResult>;
+    fetchApi: (accessToken: string, proxyUrl?: string | null) => Promise<UsageApiResult>;
     now: () => number;
     readKeychain: (now: number, homeDir: string) => {
         accessToken: string;
         subscriptionType: string;
     } | null;
+    proxyUrl?: string | null;
 };
 /**
  * Get OAuth usage data from Anthropic API.
@@ -29,7 +30,8 @@ export type UsageApiDeps = {
  * Returns { apiUnavailable: true, ... } if API call fails (to show warning in HUD).
  *
  * Uses file-based cache since HUD runs as a new process each render (~300ms).
- * Cache TTL: 60s for success, 15s for failures.
+ * A file-based fetch lock ensures only one terminal fetches at a time,
+ * preventing rate limit (429) errors from concurrent requests.
  */
 export declare function getUsage(overrides?: Partial<UsageApiDeps>): Promise<UsageData | null>;
 /**

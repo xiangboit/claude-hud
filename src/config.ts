@@ -12,6 +12,7 @@ export interface HudConfig {
   lineLayout: LineLayoutType;
   showSeparators: boolean;
   pathLevels: 1 | 2 | 3;
+  proxyUrl: string | null;
   gitStatus: {
     enabled: boolean;
     showDirty: boolean;
@@ -43,6 +44,7 @@ export const DEFAULT_CONFIG: HudConfig = {
   lineLayout: 'expanded',
   showSeparators: false,
   pathLevels: 1,
+  proxyUrl: null,
   gitStatus: {
     enabled: true,
     showDirty: true,
@@ -141,6 +143,10 @@ export function mergeConfig(userConfig: Partial<HudConfig>): HudConfig {
     ? migrated.pathLevels
     : DEFAULT_CONFIG.pathLevels;
 
+  const proxyUrl = typeof migrated.proxyUrl === 'string' && migrated.proxyUrl.trim()
+    ? migrated.proxyUrl.trim()
+    : DEFAULT_CONFIG.proxyUrl;
+
   const gitStatus = {
     enabled: typeof migrated.gitStatus?.enabled === 'boolean'
       ? migrated.gitStatus.enabled
@@ -204,7 +210,7 @@ export function mergeConfig(userConfig: Partial<HudConfig>): HudConfig {
     environmentThreshold: validateThreshold(migrated.display?.environmentThreshold, 100),
   };
 
-  return { lineLayout, showSeparators, pathLevels, gitStatus, display };
+  return { lineLayout, showSeparators, pathLevels, proxyUrl, gitStatus, display };
 }
 
 export async function loadConfig(): Promise<HudConfig> {

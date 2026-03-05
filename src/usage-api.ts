@@ -155,9 +155,10 @@ function writeCache(homeDir: string, data: UsageData, timestamp: number): void {
 // Dependency injection for testing
 export type UsageApiDeps = {
   homeDir: () => string;
-  fetchApi: (accessToken: string) => Promise<UsageApiResult>;
+  fetchApi: (accessToken: string, proxyUrl?: string | null) => Promise<UsageApiResult>;
   now: () => number;
   readKeychain: (now: number, homeDir: string) => { accessToken: string; subscriptionType: string } | null;
+  proxyUrl?: string | null;
 };
 
 const defaultDeps: UsageApiDeps = {
@@ -214,7 +215,7 @@ export async function getUsage(overrides: Partial<UsageApiDeps> = {}): Promise<U
     }
 
     // Fetch usage from API
-    const apiResult = await deps.fetchApi(accessToken);
+    const apiResult = await deps.fetchApi(accessToken, deps.proxyUrl);
     if (!apiResult.data) {
       // API call failed, cache the failure to prevent retry storms
       const failureResult: UsageData = {
@@ -556,7 +557,7 @@ function parseDate(dateStr: string | undefined): Date | null {
  * When a proxy is configured, establishes an HTTP CONNECT tunnel and wraps
  * the tunneled socket in TLS before making the API request.
  */
-function fetchUsageApi(accessToken: string): Promise<UsageApiResult> {
+function fetchUsageApi(accessToken: string, configProxyUrl?: string | null): Promise<UsageApiResult> {
   return new Promise((resolve) => {
     const targetHost = 'api.anthropic.com';
     const targetPort = 443;
@@ -564,10 +565,12 @@ function fetchUsageApi(accessToken: string): Promise<UsageApiResult> {
     const reqHeaders: Record<string, string> = {
       'Authorization': `Bearer ${accessToken}`,
       'anthropic-beta': 'oauth-2025-04-20',
-      'User-Agent': 'claude-code/2.1',
+      'User-Agent': 'claude-code/2.1 claude-hud/0.0.8',
     };
 
-    const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY
+    // Priority: config proxyUrl > env vars > direct
+    const proxyUrl = configProxyUrl
+      || process.env.https_proxy || process.env.HTTPS_PROXY
       || process.env.http_proxy || process.env.HTTP_PROXY;
 
     if (proxyUrl) {
@@ -575,7 +578,7 @@ function fetchUsageApi(accessToken: string): Promise<UsageApiResult> {
       const proxy = new URL(proxyUrl);
       const connectReq = http.request({
         host: proxy.hostname,
-        port: parseInt(proxy.port, 10) || 7890,
+        port: parseInt(proxy.port, 10) || 3128,
         method: 'CONNECT',
         path: `${targetHost}:${targetPort}`,
         timeout: 5000,

@@ -5,6 +5,7 @@ export interface HudConfig {
     lineLayout: LineLayoutType;
     showSeparators: boolean;
     pathLevels: 1 | 2 | 3;
+    proxyUrl: string | null;
     gitStatus: {
         enabled: boolean;
         showDirty: boolean;

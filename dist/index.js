@@ -38,7 +38,7 @@ export async function main(overrides = {}) {
             : null;
         // Only fetch usage if enabled in config (replaces env var requirement)
         const usageData = config.display.showUsage !== false
-            ? await deps.getUsage()
+            ? await deps.getUsage({ proxyUrl: config.proxyUrl })
             : null;
         const extraCmd = deps.parseExtraCmdArg();
         const extraLabel = extraCmd ? await deps.runExtraCmd(extraCmd) : null;
