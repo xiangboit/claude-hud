@@ -465,7 +465,7 @@ function fetchUsageApi(accessToken, configProxyUrl) {
         const reqHeaders = {
             'Authorization': `Bearer ${accessToken}`,
             'anthropic-beta': 'oauth-2025-04-20',
-            'User-Agent': 'claude-code/2.1 claude-hud/0.0.8',
+            'User-Agent': 'claude-code/2.1',
         };
         // Priority: config proxyUrl > env vars > direct
         const proxyUrl = configProxyUrl
